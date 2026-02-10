@@ -10,7 +10,7 @@ const CONFIG = {
   
   // --- TELEGRAM ---
   telegram: {
-    token: "8210818694:AAEkM0xlku87nap66L195ApOexxZ3HYja9k",
+    token: "TOKEN_ACA_EN_CONFIG_GLOBAL",
     
     // Notificaciones automáticas
     notificar_inicio_distribucion: true,   // Avisar "Procesando reportes..."
