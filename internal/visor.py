@@ -8,6 +8,7 @@ Soporta exhibiciones multi-foto (ráfaga) con galería interactiva.
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
 import re
 import socket
 import sys
@@ -86,6 +87,12 @@ STATUS_HIGHLIGHTED = "Destacado"
 STATUS_REJECTED = "Rechazado"
 
 PLACEHOLDER_IMG = "https://upload.wikimedia.org/wikipedia/commons/1/14/No_Image_Available.jpg"
+
+# Performance UX
+IMAGE_CACHE_MAX = 5  # LRU de imágenes base64 en memoria (actual + prefetch + recientes)
+PREFETCH_AHEAD = 1   # precarga foto N+1
+THUMBNAIL_SIZE = 220 # tamaño de miniatura (Drive thumbnail) en px
+FULL_IMAGE_TIMEOUT = 25.0
 
 # Colores del tema
 BG_MAIN = "#0f172a"
@@ -381,7 +388,7 @@ class BatchManager:
         self.last_photo_loaded_at: Optional[float] = None
 
         # Cache de imágenes descargadas (para thumbnails y galería)
-        self._image_cache: Dict[str, Optional[str]] = {}  # url -> base64_src or None
+        self._image_cache: "OrderedDict[str, Optional[str]]" = OrderedDict()  # url -> base64_src (LRU)
 
     def load_new_batch(self) -> bool:
         with self._lock:
@@ -580,15 +587,29 @@ class BatchManager:
             "avg_time": avg,
         }
 
-    def get_cached_image(self, url: str) -> Optional[str]:
-        """Obtiene imagen cacheada o None si no está en cache."""
-        return self._image_cache.get(url)
+    def get_cached_image(self, url: str) -> Tuple[bool, Optional[str]]:
+        """Obtiene (hit, base64_src). base64_src puede ser None (cache de fallo)."""
+        if url in self._image_cache:
+            try:
+                self._image_cache.move_to_end(url)
+            except Exception:
+                pass
+            return True, self._image_cache.get(url)
+        return False, None
 
     def cache_image(self, url: str, base64_src: Optional[str]) -> None:
-        """Guarda imagen en cache."""
+        """Guarda imagen en cache LRU (incluye fallos como None)."""
         self._image_cache[url] = base64_src
-
-
+        try:
+            self._image_cache.move_to_end(url)
+        except Exception:
+            pass
+        while len(self._image_cache) > IMAGE_CACHE_MAX:
+            try:
+                self._image_cache.popitem(last=False)
+            except Exception:
+                break
+# =============================================================================
 # =============================================================================
 # SNACKBAR HELPER
 # =============================================================================
@@ -667,13 +688,24 @@ def main(page: ft.Page) -> None:
     # IMAGE VIEWER (foto principal)
     # =========================================================================
     img_control = ft.Image(src=PLACEHOLDER_IMG, fit=ft.BoxFit.CONTAIN, expand=True, border_radius=10)
+    img_viewer = (
+        ft.InteractiveViewer(
+            content=img_control,
+            min_scale=0.5,
+            max_scale=5.0,
+            pan_enabled=True,
+            scale_enabled=True,
+        )
+        if hasattr(ft, "InteractiveViewer") else img_control
+    )
+
 
     btn_prev_exh = ft.IconButton(icon=ft.Icons.ARROW_BACK, icon_size=36, tooltip="Exhibicion anterior", disabled=True)
     btn_next_exh = ft.IconButton(icon=ft.Icons.ARROW_FORWARD, icon_size=36, tooltip="Siguiente exhibicion", disabled=True)
 
     img_container = ft.Container(
         content=ft.Row(
-            [btn_prev_exh, ft.Container(content=img_control, expand=True), btn_next_exh],
+            [btn_prev_exh, ft.Container(content=img_viewer, expand=True), btn_next_exh],
             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
         ),
         bgcolor=BG_IMG,
@@ -1035,8 +1067,8 @@ def main(page: ft.Page) -> None:
 
         page.update()
 
-    def _build_thumbnail(index: int, foto: Dict[str, Any], is_active: bool, is_seen: bool) -> ft.Container:
-        """Construye un widget de miniatura para la galería."""
+    def _build_thumbnail(index: int, foto: Dict[str, Any], is_active: bool, is_seen: bool) -> ft.Control:
+        """Miniatura: usa Drive thumbnail (cliente) para no bloquear Python."""
         if is_active:
             border = ft.border.all(3, THUMB_ACTIVE_BORDER)
             bg = BG_IMG
@@ -1047,11 +1079,15 @@ def main(page: ft.Page) -> None:
             border = ft.border.all(1, "white20")
             bg = THUMB_UNSEEN_BG
 
-        status_icon = ""
-        if is_seen:
-            status_icon = "✓"
-
+        status_icon = "✓" if is_seen else ""
         label = ft.Text(f"Foto {index + 1} {status_icon}", size=10, text_align=ft.TextAlign.CENTER)
+
+        raw_url = str(foto.get("url_foto") or "").strip()
+        fid = drive_file_id(raw_url)
+        thumb_src = (
+            f"https://drive.google.com/thumbnail?id={fid}&sz=w{THUMBNAIL_SIZE}"
+            if fid else (raw_url if raw_url.startswith("http") else PLACEHOLDER_IMG)
+        )
 
         def on_thumb_click(e, idx=index):
             navigate_to_photo(idx)
@@ -1060,10 +1096,12 @@ def main(page: ft.Page) -> None:
             content=ft.Column(
                 [
                     ft.Container(
-                        content=ft.Icon(
-                            ft.Icons.IMAGE,
-                            size=28,
-                            color=COLOR_GREEN if is_seen else (COLOR_CYAN if is_active else COLOR_MUTED),
+                        content=ft.Image(
+                            src=thumb_src,
+                            width=60,
+                            height=50,
+                            fit=ft.BoxFit.COVER,
+                            border_radius=6,
                         ),
                         width=60,
                         height=50,
@@ -1129,47 +1167,104 @@ def main(page: ft.Page) -> None:
 
         page.update()
 
+
+    # ---------------------------------------------------------------------
+    # ULTRAVELOZ: carga en background + prefetch + cache LRU
+    # ---------------------------------------------------------------------
+    img_req_token = {"value": 0}
+    _inflight_lock = threading.Lock()
+    _inflight_urls: Set[str] = set()
+
+    def _queue_image_download(url: str, *, update_ui: bool, token: int) -> None:
+        u = (url or "").strip()
+        if not u or not u.startswith("http"):
+            return
+
+        with _inflight_lock:
+            if u in _inflight_urls:
+                return
+            _inflight_urls.add(u)
+
+        def _worker() -> None:
+            data, reason = fetch_image_bytes(u, timeout=FULL_IMAGE_TIMEOUT)
+            src: Optional[str] = None
+            if data:
+                try:
+                    src = _bytes_to_base64_src(data)
+                except Exception:
+                    src = None
+                    reason = "DECODE_ERROR"
+
+            manager.cache_image(u, src)
+
+            with _inflight_lock:
+                _inflight_urls.discard(u)
+
+            def _done() -> None:
+                if not update_ui:
+                    return
+                if token != img_req_token["value"]:
+                    return
+                img_control.src = src or PLACEHOLDER_IMG
+                last_img_reason["value"] = reason if src else f"{reason}"
+                update_details()
+
+            page.run_thread(_done)
+
+        page.run_thread(_worker)
+
+    def _prefetch_next_photo() -> None:
+        exh = manager.get_current_exhibition()
+        if not exh:
+            return
+        fotos = exh.get("fotos", [])
+        nxt = manager.current_photo_index + PREFETCH_AHEAD
+        if not (0 <= nxt < len(fotos)):
+            return
+        nxt_url = str((fotos[nxt] or {}).get("url_foto") or "").strip()
+        if not nxt_url:
+            return
+        hit, _ = manager.get_cached_image(nxt_url)
+        if hit:
+            return
+        _queue_image_download(nxt_url, update_ui=False, token=0)
+
     def show_current_photo() -> None:
-        """Muestra la foto actual de la exhibición actual."""
+        """Muestra foto actual sin bloquear UI (placeholder inmediato + descarga background)."""
         photo = manager.get_current_photo()
         if not photo:
             set_eval_buttons_enabled(False)
             return
 
+        # Token anticarrera: si el usuario navega rápido, ignoramos descargas viejas
+        img_req_token["value"] += 1
+        token = img_req_token["value"]
+
         img_control.src = PLACEHOLDER_IMG
-        last_img_reason["value"] = "-"
+        last_img_reason["value"] = "CARGANDO..."
         update_details()
+        page.update()
 
         link = str(photo.get("url_foto") or "").strip()
         if link:
-            # Intentar cache primero
-            cached = manager.get_cached_image(link)
-            if cached is not None:
-                img_control.src = cached
-                last_img_reason["value"] = "OK (cache)"
+            hit, cached_src = manager.get_cached_image(link)
+            if hit:
+                img_control.src = cached_src or PLACEHOLDER_IMG
+                last_img_reason["value"] = "OK (cache)" if cached_src else "FALLÓ (cache)"
             else:
-                data, reason = fetch_image_bytes(link)
-                last_img_reason["value"] = reason
-                if data:
-                    try:
-                        src = _bytes_to_base64_src(data)
-                        img_control.src = src
-                        manager.cache_image(link, src)
-                    except Exception:
-                        img_control.src = PLACEHOLDER_IMG
-                        manager.cache_image(link, None)
-                else:
-                    manager.cache_image(link, None)
+                _queue_image_download(link, update_ui=True, token=token)
         else:
             last_img_reason["value"] = "SIN_LINK"
 
-        # Marcar como vista
+        # Marcar como vista (intención de vista) + actualizar UI de estado
         manager.mark_photo_seen()
-
         update_progress()
         update_gallery()
         update_eval_buttons()
         update_details()
+
+        # Prefetch inteligente
+        _prefetch_next_photo()
 
     def navigate_to_photo(index: int) -> None:
         """Navega a una foto específica dentro de la exhibición."""

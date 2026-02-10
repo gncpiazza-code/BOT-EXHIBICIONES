@@ -461,6 +461,50 @@ active_transactions: Dict[int, Dict[str, Any]] = {}
 STAGE_WAITING_ID = "WAITING_ID"
 STAGE_WAITING_TYPE = "WAITING_TYPE"
 
+# =============================================================================
+# POS TYPES CACHE (evita bloqueo por Google Sheets)
+# =============================================================================
+POS_TYPES_CACHE_TTL_SECONDS = int(os.getenv("POS_TYPES_CACHE_TTL_SECONDS", "14400"))  # 4h
+_pos_types_cache: Dict[str, Any] = {"expires_at": 0.0, "types": []}
+_pos_types_lock = asyncio.Lock()
+
+async def get_pos_types_cached(*, force: bool = False) -> List[str]:
+    """
+    Devuelve la lista de tipos de PDV, cacheada por TTL.
+
+    Motivo:
+        sheets.get_pos_types() es síncrono (Google Sheets) y puede demorar varios segundos.
+        En handlers async (PTB), eso bloquea el event loop y provoca timeouts HTTP hacia Telegram.
+    """
+    now = time.time()
+    cached: List[str] = _pos_types_cache.get("types") or []
+    if not force and cached and now < float(_pos_types_cache.get("expires_at") or 0.0):
+        return cached
+
+    async with _pos_types_lock:
+        now = time.time()
+        cached = _pos_types_cache.get("types") or []
+        if not force and cached and now < float(_pos_types_cache.get("expires_at") or 0.0):
+            return cached
+
+        try:
+            tipos: List[str] = await asyncio.to_thread(sheets.get_pos_types)
+        except Exception as e:
+            logger.error(f"❌ Error refrescando tipos de PDV: {e}", exc_info=True)
+            return cached
+
+        if tipos:
+            _pos_types_cache["types"] = tipos
+            _pos_types_cache["expires_at"] = now + POS_TYPES_CACHE_TTL_SECONDS
+            return tipos
+
+        return cached
+
+async def refresh_pos_types_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Warm-up / refresh periódico
+    await get_pos_types_cached(force=True)
+
+
 start_time = time.time()
 session_stats = {"procesadas": 0, "aprobadas": 0, "rechazadas": 0}
 
@@ -1665,8 +1709,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         # ✅ BOTONES DINÁMICOS
         try:
-            tipos_disponibles = sheets.get_pos_types()
-            
+            tipos_disponibles = await get_pos_types_cached()
             if not tipos_disponibles:
                 logger.error("❌ No se obtuvieron tipos de PDV desde Sheets")
                 await update.message.reply_text(
@@ -1753,7 +1796,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         tipo_pdv_display = clean_code # Fallback
         
         # Buscar el nombre original en la lista de Sheets
-        all_types = sheets.get_pos_types()
+        all_types = await get_pos_types_cached()
         for t in all_types:
             code_from_sheet = "".join(c for c in t if c.isalnum()).upper()
             if code_from_sheet == clean_code:
@@ -2289,6 +2332,8 @@ if __name__ == "__main__":
     if host_lock:
         app.job_queue.run_repeating(update_host_heartbeat, interval=60, first=10)
     app.job_queue.run_repeating(send_periodic_status, interval=14400, first=60)
+    app.job_queue.run_repeating(refresh_pos_types_job, interval=POS_TYPES_CACHE_TTL_SECONDS, first=10)
+
 
     print("🚀 BOT ONLINE (HOST)")
 
