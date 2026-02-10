@@ -1,8 +1,8 @@
-/***** tracker.gs *****/
+/***** tracker.gs - VERSIÓN CON TRACKING MEJORADO *****/
 
 // ==========================================
 // 🎯 TRACKER PRO - Sistema de Seguimiento
-// VERSIÓN 4.2 - Ingeniería de Datos (Triangulación sin GPS)
+// VERSIÓN 4.3 - Con columna "Abrió" y formato condicional
 // ==========================================
 
 function doGet(e) {
@@ -60,9 +60,10 @@ function registrarClickInicial(datos) {
   if (!hoja) {
     hoja = crearHojaTrackingPro(ss, pestañaTracking);
   } else {
-    // Aseguramos que se vea la columna del Link (ahora es la J -> 10)
+    // Aseguramos que se vean las columnas (ahora son J y K)
     try {
-      hoja.showColumns(10); 
+      hoja.showColumns(10); // J
+      hoja.showColumns(11); // K
       verificarEncabezados(hoja);
     } catch(e) {}
   }
@@ -74,7 +75,7 @@ function registrarClickInicial(datos) {
   const tipoReporte = detectarTipoReporte(datos.archivo);
   const tiempoReaccion = calcularTiempoReaccion(datos.fechaEnvio, ahora);
   
-  // Fila inicial (Estructura limpia)
+  // Fila inicial (Estructura con columna "Abrió" K)
   const fila = [
     fechaVista,                    // A: Fecha
     horaVista,                     // B: Hora
@@ -86,10 +87,14 @@ function registrarClickInicial(datos) {
     "Detectando...",               // H: Navegador
     "Detectando...",               // I: Sistema
     datos.url,                     // J: LINK
-    "Detectando..."                // K: Ubicación (Aquí irá la triangulación)
+    "No"                           // K: ✅ ABRIÓ (inicialmente "No", se actualiza al hacer click)
   ];
   
   hoja.appendRow(fila);
+  
+  // 🆕 NUEVO: Aplicar formato condicional a la fila
+  const ultimaFila = hoja.getLastRow();
+  aplicarFormatoCondicional(hoja, ultimaFila, tiempoReaccion.minutos);
 }
 
 // Verifica y corrige encabezados si faltan
@@ -103,10 +108,10 @@ function verificarEncabezados(hoja) {
     hoja.setColumnWidth(10, 250); 
   }
   
-  // Ubicación en columna 11 (K)
-  if (valores[1] !== "📍 UBICACIÓN") {
-    hoja.getRange("K1").setValue("📍 UBICACIÓN");
-    hoja.setColumnWidth(11, 200); // Un poco más ancha para ver el ISP
+  // Abrió en columna 11 (K)
+  if (valores[1] !== "✅ ABRIÓ") {
+    hoja.getRange("K1").setValue("✅ ABRIÓ");
+    hoja.setColumnWidth(11, 100);
   }
   
   // Estilo
@@ -147,8 +152,52 @@ function actualizarMetadataUltimoRegistro(vendedor, userAgent, ubicacion) {
   hoja.getRange(filaActualizar, 8).setValue(metadata.navegador);   // H
   hoja.getRange(filaActualizar, 9).setValue(metadata.so);          // I
   
-  // Actualiza K (Ubicación Triangulada)
-  if (ubicacion) hoja.getRange(filaActualizar, 11).setValue(ubicacion);
+  // 🆕 NUEVO: Marcar como "Sí" en la columna K (Abrió)
+  hoja.getRange(filaActualizar, 11).setValue("Sí");
+  
+  // Actualizar ubicación si existe
+  if (ubicacion) {
+    // Si hay una columna L para ubicación detallada, usar esa
+    // Por ahora, la ubicación está en I (Sistema), así que se puede agregar
+    // Opcional: agregar columna nueva o dejar en I
+  }
+  
+  // 🆕 NUEVO: Actualizar formato condicional (ahora que sabemos que abrió)
+  const tiempoReaccionStr = datos[filaActualizar - 1][5]; // Columna F
+  const minutos = parsearTiempoReaccion(tiempoReaccionStr);
+  aplicarFormatoCondicional(hoja, filaActualizar, minutos);
+}
+
+
+// ==========================================
+// 🎨 FORMATO CONDICIONAL
+// ==========================================
+/**
+ * Aplica color de fondo según tiempo de reacción
+ * Verde: < 30 min
+ * Amarillo: 30 min - 2 hs
+ * Naranja: 2 hs - 24 hs
+ * Rojo: > 24 hs o no abrió
+ */
+function aplicarFormatoCondicional(hoja, fila, minutos) {
+  const rangoFila = hoja.getRange(fila, 1, 1, 11); // Columnas A-K
+  
+  let color = "#ffffff"; // Blanco por defecto
+  
+  if (minutos === 0) {
+    // No se calculó tiempo (todavía no abrió)
+    color = "#fecaca"; // Rojo claro
+  } else if (minutos < 30) {
+    color = "#d1fae5"; // Verde claro
+  } else if (minutos < 120) { // 2 horas
+    color = "#fef3c7"; // Amarillo claro
+  } else if (minutos < 1440) { // 24 horas
+    color = "#fed7aa"; // Naranja claro
+  } else {
+    color = "#fecaca"; // Rojo claro
+  }
+  
+  rangoFila.setBackground(color);
 }
 
 
@@ -253,33 +302,7 @@ function generarPantallaRedirect(datos) {
     const opciones = { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' };
     document.getElementById('reloj').innerText = "Acceso: " + ahora.toLocaleDateString('es-AR', opciones);
 
-    // 2. INGENIERÍA DE DATOS (Recolectando pistas)
-    let datosRed = {
-      ciudad: "...",
-      provincia: "",
-      isp: "",
-      zonaHoraria: ""
-    };
-
-    // A. Pista 1: Zona Horaria del Dispositivo
-    try {
-      datosRed.zonaHoraria = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    } catch(e) { datosRed.zonaHoraria = ""; }
-
-    // B. Pista 2: IP y Proveedor (Async)
-    fetch('https://ipwho.is/') 
-      .then(r => r.json())
-      .then(d => { 
-        if(d.success) {
-          datosRed.ciudad = d.city;
-          datosRed.provincia = d.region;
-          datosRed.isp = d.connection.isp || "ISP Desconocido";
-        }
-      })
-      .catch(e => {});
-
-
-    // 3. PROCESO DE ANÁLISIS Y ENVÍO
+    // 2. PROCESO DE ANÁLISIS Y ENVÍO
     function iniciarProceso() {
       const btn = document.getElementById('btnEntrar');
       const spinner = document.getElementById('spinner');
@@ -289,46 +312,18 @@ function generarPantallaRedirect(datos) {
       spinner.style.display = 'block';
       btnText.innerText = "ABRIENDO...";
 
-      // --- LÓGICA DE TRIANGULACIÓN ---
-      let resultadoFinal = "";
-      
-      // Detectamos si es un proveedor móvil conocido
-      const esRedMovil = /Telecom|Personal|Claro|Movistar|AMX|Telefonica/i.test(datosRed.isp);
-      const esBsAs = /Buenos Aires|CABA/i.test(datosRed.provincia) || /Buenos Aires/i.test(datosRed.ciudad);
-      
-      // Buscamos contradicciones en la Zona Horaria (El "Backdoor" de configuración)
-      let zonaExtra = "";
-      if (datosRed.zonaHoraria.includes("Cordoba")) zonaExtra = " (Zona: CBA)";
-      if (datosRed.zonaHoraria.includes("Jujuy")) zonaExtra = " (Zona: JUJ)";
-      if (datosRed.zonaHoraria.includes("Mendoza")) zonaExtra = " (Zona: MDZ)";
-      if (datosRed.zonaHoraria.includes("Tucuman")) zonaExtra = " (Zona: TUC)";
-
-      // Decisión del Sistema
-      if (esRedMovil && esBsAs && zonaExtra === "") {
-        // Caso: Red Móvil + IP BsAs + Sin Zona Horaria especial
-        // Veredicto: Ubicación falsa por antena
-        resultadoFinal = "⚠️ Red Móvil (Antena: BsAs)";
-      } else {
-        // Caso: WiFi o Ciudad del Interior o Zona Horaria detectada
-        // Limpiamos nombre del ISP para que entre en la celda
-        let ispCorto = datosRed.isp
-          .replace("Telecom Argentina S.A.", "Personal")
-          .replace("Telefonica de Argentina", "Movistar")
-          .replace("AMX Argentina S.A.", "Claro");
-          
-        resultadoFinal = \`\${datosRed.ciudad}, \${datosRed.provincia} (\${ispCorto})\` + zonaExtra;
-      }
-      // -------------------------------
-
       const urlWebApp = "${urlWebApp}";
       const vendedor = "${escapeHtml(datos.vendedor)}";
       const ua = navigator.userAgent;
+      
+      // Geo simple (no necesitamos triangulación compleja para esta versión)
+      const geo = "Detectado";
       
       const urlUpdate = urlWebApp + 
         "?action=update" +
         "&vendedor=" + encodeURIComponent(vendedor) +
         "&ua=" + encodeURIComponent(ua) +
-        "&geo=" + encodeURIComponent(resultadoFinal);
+        "&geo=" + encodeURIComponent(geo);
 
       fetch(urlUpdate, { mode: 'no-cors' })
         .then(() => redirigir())
@@ -378,9 +373,13 @@ function crearHojaTrackingPro(ss, nombre) {
     "📅 FECHA", "⏰ HORA", "👤 VENDEDOR", "📂 TIPO", 
     "📤 ENVIADO", "⏱️ REACCIÓN", 
     "📱 DISPOSITIVO", "🌐 NAVEGADOR", "💻 SISTEMA", 
-    "🔗 LINK", "📍 UBICACIÓN"
+    "🔗 LINK", "✅ ABRIÓ"
   ]]).setFontWeight("bold").setBackground("#0f172a").setFontColor("white");
   hoja.setFrozenRows(1);
+  
+  // Anchos de columna
+  hoja.setColumnWidth(11, 100); // K: Abrió
+  
   return hoja;
 }
 
@@ -393,7 +392,7 @@ function detectarTipoReporte(nombre) {
 }
 
 function calcularTiempoReaccion(envio, ahora) {
-  if(!envio) return { texto: "-" };
+  if(!envio) return { texto: "-", minutos: 0 };
   try {
      const partes = envio.split(' ');
      const f = partes[0].split('/');
@@ -402,7 +401,19 @@ function calcularTiempoReaccion(envio, ahora) {
      const min = Math.floor((ahora - fechaEnvio)/60000);
      if (min < 60) return { minutos: min, texto: min + " min" };
      return { minutos: min, texto: Math.floor(min/60) + " hs" };
-  } catch(e) { return { texto: "-" }; }
+  } catch(e) { return { texto: "-", minutos: 0 }; }
+}
+
+function parsearTiempoReaccion(str) {
+  if (!str || str === "-") return 0;
+  
+  const minMatch = str.match(/(\d+)\s*min/i);
+  if (minMatch) return parseInt(minMatch[1], 10);
+  
+  const hsMatch = str.match(/(\d+)\s*hs/i);
+  if (hsMatch) return parseInt(hsMatch[1], 10) * 60;
+  
+  return 0;
 }
 
 function parseUserAgent(ua) {

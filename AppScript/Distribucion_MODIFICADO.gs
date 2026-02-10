@@ -1,4 +1,4 @@
-/***** distribucion.gs *****/
+/***** distribucion.gs - VERSIÓN CON ANALYTICS *****/
 
 // ==========================================
 // 🔧 Este archivo ahora usa CONFIG.gs
@@ -167,6 +167,13 @@ function distribuirDatos_NativoCopy(spreadsheetTemporal, mapeoCompleto, tipoRepo
   
   // Guardar dashboard de la distribución
   registrarDistribucionEnDashboard(nombreArchivo, stats);
+  
+  // 🆕 NUEVO: Actualizar dashboard automático
+  try {
+    actualizarDashboard();
+  } catch (e) {
+    logAConsola(`⚠️ Error actualizando dashboard: ${e}`, "warn");
+  }
 }
 
 

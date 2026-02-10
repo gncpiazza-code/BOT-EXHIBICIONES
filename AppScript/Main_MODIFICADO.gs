@@ -1,15 +1,11 @@
-/***** main.gs - VERSIÓN COMPLETA Y CORREGIDA *****/
+/***** main.gs - VERSIÓN MEJORADA CON BROADCAST Y ANALYTICS *****/
 
 // ==========================================
 // 🔧 Este archivo ahora usa CONFIG.gs
 // ==========================================
 
 /**
- * MENÚ INICIAL
- * - Ejecutar distribución AHORA = modo viejo (una sola corrida monolítica)
- * - Iniciar/Reanudar cola      = modo nuevo con cola/checkpoints + trigger
- * - Pausar cola                = apaga el trigger recurrente (mantiene la cola)
- * - Borrar y Detener Cola      = apaga el trigger Y borra la cola (Reset)
+ * MENÚ INICIAL + INICIALIZACIÓN DE PESTAÑAS Y BOTONES
  */
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
@@ -19,9 +15,47 @@ function onOpen() {
     .addItem('▶️ Iniciar/Reanudar cola automática', 'iniciarColaAuto')
     .addItem('⏸️ Pausar cola (Solo detener trigger)', 'detenerColaAuto')
     .addItem('⏹️ Borrar y Detener Cola (Reset)', 'borrarColaYDetener') 
+    .addSeparator()
+    .addItem('📊 Actualizar Dashboard', 'ANALYTICS_actualizarDashboard')
+    .addItem('🎨 Recrear Botones', 'inicializarBotonesPestañas')
     .addToUi();
+  
   // Inicializa consola visual (sin borrar)
-  try { consolaInit_Pro(false); } catch(e) {}
+  try { 
+    consolaInit_Pro(false); 
+  } catch(e) {}
+  
+  // 🆕 NUEVO: Crear pestañas si no existen
+  try {
+    inicializarPestañas();
+  } catch(e) {
+    Logger.log("Error inicializando pestañas: " + e);
+  }
+  
+  // 🆕 NUEVO: Crear botones en pestañas
+  try {
+    inicializarBotonesPestañas();
+  } catch(e) {
+    Logger.log("Error inicializando botones: " + e);
+  }
+}
+
+
+/**
+ * 🆕 NUEVO: Inicializa todas las pestañas necesarias
+ */
+function inicializarPestañas() {
+  // Crear BROADCAST si no existe
+  crearPestañaBroadcast();
+  
+  // Crear ANALYTICS_DASHBOARD si no existe (o verificar)
+  const hojaId = getConfig("google.hoja_mapeo");
+  const ss = SpreadsheetApp.openById(hojaId);
+  let analytics = ss.getSheetByName("ANALYTICS_DASHBOARD");
+  
+  if (!analytics) {
+    crearPestañaAnalytics();
+  }
 }
 
 
@@ -58,6 +92,7 @@ function ejecutarManualmente() {
  * - Copia hojas completas (con estilos) a cada vendedor
  * - Borra Sheets temporal
  * - Mueve archivo a "Archivados"
+ * - 🆕 Actualiza Dashboard al finalizar
  */
 function ejecutarDistribucionDeReportes() {
   try {
@@ -133,6 +168,14 @@ function ejecutarDistribucionDeReportes() {
       logAConsola("No se encontraron archivos .xlsx para procesar.", "warn");
     }
     logAConsola(`✔ Proceso manual completado. ${archivosProcesados} archivo(s) procesado(s).`, "ok");
+    
+    // 🆕 NUEVO: Actualizar dashboard al finalizar
+    try {
+      actualizarDashboard();
+    } catch (e) {
+      logAConsola(`⚠️ Error actualizando dashboard: ${e}`, "warn");
+    }
+    
   } catch (e) {
     logAConsola(`ERROR FATAL en ejecutarDistribucionDeReportes: ${e}`, "error");
   }
@@ -216,6 +259,14 @@ function continuarEjecucionAuto() {
       logAConsola("✅ Cola completada. Deteniendo trigger.", "ok");
       stopProcessingTrigger_();
       clearQueueState_();
+      
+      // 🆕 NUEVO: Actualizar dashboard al finalizar
+      try {
+        actualizarDashboard();
+      } catch (e) {
+        logAConsola(`⚠️ Error actualizando dashboard: ${e}`, "warn");
+      }
+      
       return;
     }
 
@@ -265,6 +316,13 @@ function continuarEjecucionAuto() {
     logAConsola("✅ Cola completada sin timeout. Deteniendo trigger.", "ok");
     stopProcessingTrigger_();
     clearQueueState_();
+    
+    // 🆕 NUEVO: Actualizar dashboard al finalizar
+    try {
+      actualizarDashboard();
+    } catch (e) {
+      logAConsola(`⚠️ Error actualizando dashboard: ${e}`, "warn");
+    }
 
   } catch (e) {
     logAConsola(`❌ ERROR en continuarEjecucionAuto: ${e}`, "error");
