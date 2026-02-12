@@ -920,7 +920,7 @@ def main(page: ft.Page) -> None:
     )
 
     # Badge "DESTACADA" flotante sobre la imagen
-    carousel_star = _asset_or_fallback("star-burst.png", 20, 20, "🔥", AMBER)
+    carousel_star = _asset_or_fallback("star-burst.png", 28, 28, "🔥", AMBER)
     carousel_dest_badge = ft.Container(
         content=ft.Row(
             spacing=4,
@@ -1290,7 +1290,7 @@ def main(page: ft.Page) -> None:
         change = state["rank_changes"].get(vendor, 0)
 
         if change == "new":
-            badge_img = _asset_or_fallback("new-badge.png", 36, 20, "NEW", CYAN)
+            badge_img = _asset_or_fallback("new-badge.png", 48, 32, "NEW", CYAN)
             return ft.Container(
                 content=badge_img,
                 padding=_padding_symmetric(4, 2),
@@ -1299,7 +1299,7 @@ def main(page: ft.Page) -> None:
             )
 
         if isinstance(change, (int, float)) and change > 0:
-            arrow = _asset_or_fallback("arrow-up.png", 16, 16, "▲", GREEN)
+            arrow = _asset_or_fallback("arrow-up.png", 24, 24, "▲", GREEN)
             return ft.Row(
                 spacing=2,
                 controls=[
@@ -1309,7 +1309,7 @@ def main(page: ft.Page) -> None:
             )
 
         if isinstance(change, (int, float)) and change < 0:
-            arrow = _asset_or_fallback("arrow-down.png", 16, 16, "▼", RED)
+            arrow = _asset_or_fallback("arrow-down.png", 24, 24, "▼", RED)
             return ft.Row(
                 spacing=2,
                 controls=[
@@ -1318,7 +1318,7 @@ def main(page: ft.Page) -> None:
                 ],
             )
 
-        equal = _asset_or_fallback("equals.png", 14, 14, "=", MUTED)
+        equal = _asset_or_fallback("equals.png", 24, 24, "=", MUTED)
         return equal
 
     def render_rank(data: List[Dict[str, Any]]) -> None:
