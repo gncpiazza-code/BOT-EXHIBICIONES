@@ -1647,6 +1647,267 @@ async def cmd_test_horarios(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
+# =============================================================================
+# TIMEOUTS DE SESIÓN Y PROCESAMIENTO DE SUBIDA
+# =============================================================================
+TIMEOUT_WAITING_ID_SECONDS = 600   # 10 min para enviar nro_cliente
+TIMEOUT_WAITING_TYPE_SECONDS = 300  # 5 min para elegir tipo PDV
+
+
+def _cancel_session_timeout(session: dict) -> None:
+    """Cancela el timeout job de una sesión si existe."""
+    job = session.get("timeout_job")
+    if job:
+        job.schedule_removal()
+        session["timeout_job"] = None
+
+
+async def _process_upload_session(bot, user_id: int, session: dict) -> bool:
+    """
+    Procesa la subida de una sesión completa: descarga fotos de Telegram,
+    sube a Drive, registra en Sheets, y envía el mensaje de evaluación.
+    Limpia la sesión de upload_sessions al finalizar.
+    Returns True si se procesaron fotos correctamente.
+    """
+    tipo_pdv_display = session["tipo_pdv"]
+    nro_cliente = session["nro_cliente"]
+    photos = session["photos"]
+    chat_id = session["chat_id"]
+    uploader_name = session.get("vendor_name", "Usuario")
+    group_title = session.get("chat_title") or str(chat_id)
+
+    clean_code = "".join(c for c in tipo_pdv_display if c.isalnum()).upper()
+
+    procesadas_count = 0
+    referencias_subidas = []
+
+    for photo_data in photos:
+        file_id = photo_data["file_id"]
+        message_id = photo_data["message_id"]
+
+        try:
+            file = await bot.get_file(file_id)
+            file_bytes = await file.download_as_bytearray()
+
+            result = sheets.upload_image_to_drive(
+                file_bytes=bytes(file_bytes),
+                filename=f"{nro_cliente}_{clean_code}_{int(time.time())}.jpg",
+                user_id=user_id,
+                username=uploader_name
+                , group_title=group_title
+            )
+
+            if result and result.drive_link:
+                uuid_ref = sheets.log_raw(
+                    user_id=user_id,
+                    username=uploader_name,
+                    nro_cliente=nro_cliente,
+                    tipo_pdv=tipo_pdv_display,
+                    drive_link=result.drive_link
+                    , group_title=group_title
+                    , chat_id=chat_id
+                )
+
+                if uuid_ref:
+                    referencias_subidas.append({
+                        "uuid": uuid_ref,
+                        "message_id": message_id,
+                        "drive_link": result.drive_link
+                    })
+                    procesadas_count += 1
+        except Exception as e:
+            logger.error(f"Error procesando subida inmediata: {e}")
+
+    if procesadas_count > 0:
+        try:
+            primera_ref = referencias_subidas[0]
+
+            if procesadas_count > 1:
+                fotos_text = f"📸 <b>{procesadas_count} fotos subidas</b>\n\n"
+            else:
+                fotos_text = ""
+
+            historial = []
+            try:
+                historial = await asyncio.to_thread(
+                    sheets.get_client_history_in_group,
+                    nro_cliente,
+                    chat_id,
+                    5
+                )
+            except Exception as e:
+                logger.debug(f"No se pudo obtener historial PDV: {e}")
+
+            historial_text = ""
+            if historial:
+                estado_emoji = {
+                    "Aprobado":  "✅",
+                    "Destacado": "🔥",
+                    "Rechazado": "❌",
+                    "Pendiente": "⏳",
+                }
+                lineas = []
+                for h in historial:
+                    emoji = estado_emoji.get(h["estado"], "❓")
+                    lineas.append(
+                        f"   • {h['fecha']} — {h['tipo_pdv']} — {emoji} {h['estado']}"
+                    )
+                total_hist = len(historial)
+                historial_text = (
+                    f"\n\n📂 <b>Historial en este PDV ({total_hist} anteriores):</b>\n"
+                    + "\n".join(lineas)
+                )
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Aprobar", callback_data=f"APR_{primera_ref['uuid']}_{user_id}"),
+                    InlineKeyboardButton("❌ Rechazar", callback_data=f"REC_{primera_ref['uuid']}_{user_id}")
+                ],
+                [
+                    InlineKeyboardButton("🔥 Destacado", callback_data=f"DES_{primera_ref['uuid']}_{user_id}")
+                ]
+            ]
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            msg_text = (
+                f"📋 <b>Nueva exhibición</b>\n\n"
+                f"{fotos_text}"
+                f"👤 <b>Vendedor:</b> {uploader_name}\n"
+                f"🏪 <b>Cliente:</b> {nro_cliente}\n"
+                f"📍 <b>Tipo:</b> {tipo_pdv_display}\n"
+                f"🔗 <a href='{primera_ref['drive_link']}'>Ver en Drive</a>"
+                f"{historial_text}\n\n"
+                f"<b>Evaluar:</b>"
+            )
+
+            sent_msg = await bot.send_message(
+                chat_id=chat_id,
+                text=msg_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+                reply_to_message_id=primera_ref["message_id"]
+            )
+
+            for ref_data in referencias_subidas:
+                sheets.update_telegram_refs(
+                    uuid_ref=ref_data["uuid"],
+                    chat_id=int(chat_id),
+                    msg_id=int(sent_msg.message_id)
+                )
+
+            active_transactions[sent_msg.message_id] = {
+                "uuid": primera_ref["uuid"],
+                "uploader_id": user_id,
+                "ref_msg": primera_ref["message_id"],
+                "total_fotos": procesadas_count
+            }
+
+        except Exception as e:
+            logger.error(f"Error en post-procesamiento: {e}")
+    else:
+        try:
+            first_photo_msg = photos[0]["message_id"] if photos else None
+            await bot.send_message(
+                chat_id=chat_id,
+                text="❌ Error al subir las fotos a Drive.",
+                reply_to_message_id=first_photo_msg
+            )
+        except:
+            pass
+
+    # Limpiar sesión
+    if user_id in upload_sessions:
+        del upload_sessions[user_id]
+
+    return procesadas_count > 0
+
+
+async def _timeout_waiting_id(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Timeout de 10 min: el vendedor no envió nro_cliente. Cancelar sesión."""
+    data = context.job.data
+    user_id = data["user_id"]
+
+    session = upload_sessions.get(user_id)
+    if not session or session.get("stage") != STAGE_WAITING_ID:
+        return  # La sesión ya avanzó o fue limpiada
+
+    chat_id = session["chat_id"]
+    photos = session.get("photos", [])
+    first_msg_id = photos[0]["message_id"] if photos else None
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⏱ <b>Carga cancelada</b>\n\n"
+                "Pasaron <b>10 minutos</b> sin recibir el número de cliente, "
+                "por lo que la imagen <b>no fue registrada</b>.\n\n"
+                "📸 Para cargarla correctamente, volvé a enviar la foto "
+                "y completá los datos a tiempo."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=first_msg_id
+        )
+    except Exception as e:
+        logger.error(f"Error enviando mensaje de timeout WAITING_ID: {e}")
+
+    if user_id in upload_sessions:
+        del upload_sessions[user_id]
+    logger.info(f"⏱ Timeout WAITING_ID: sesión cancelada para user_id={user_id}")
+
+
+async def _timeout_waiting_type(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Timeout de 5 min: auto-seleccionar primer tipo de PDV y procesar."""
+    data = context.job.data
+    user_id = data["user_id"]
+
+    session = upload_sessions.get(user_id)
+    if not session or session.get("stage") != STAGE_WAITING_TYPE:
+        return  # La sesión ya fue procesada o limpiada
+
+    # Guard contra race condition con click real del vendedor
+    if session.get("_processing"):
+        return
+    session["_processing"] = True
+
+    try:
+        tipos = await get_pos_types_cached()
+        if not tipos:
+            logger.error("⏱ Timeout WAITING_TYPE: no hay tipos de PDV disponibles")
+            if user_id in upload_sessions:
+                del upload_sessions[user_id]
+            return
+
+        tipo_default = tipos[0]
+        session["tipo_pdv"] = tipo_default
+
+        # Quitar botones de selección silenciosamente
+        buttons_msg_id = session.get("buttons_message_id")
+        chat_id = session["chat_id"]
+        if buttons_msg_id:
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=buttons_msg_id,
+                    reply_markup=None
+                )
+            except Exception:
+                pass
+
+        logger.info(
+            f"⏱ Timeout WAITING_TYPE: auto-seleccionando '{tipo_default}' "
+            f"para user_id={user_id}"
+        )
+
+        await _process_upload_session(context.bot, user_id, session)
+
+    except Exception as e:
+        logger.error(f"Error en timeout WAITING_TYPE: {e}")
+        if user_id in upload_sessions:
+            del upload_sessions[user_id]
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.photo:
         return
@@ -1794,6 +2055,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     is_old = session_exists and (now - upload_sessions[user_id].get("last_photo_time", 0) > 8)
     
     if not session_exists or is_stuck or is_old:
+        # Cancelar timeout de sesión anterior si existe
+        if session_exists:
+            _cancel_session_timeout(upload_sessions[user_id])
+
         # Crear nueva sesión O resetear si está colgada en WAITING_TYPE
         if is_stuck:
             logger.warning(f"🔄 Sesión colgada detectada para {username} (user_id={user_id}). Reseteando...")
@@ -1818,12 +2083,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "chat_id": chat_id,
             "chat_title": (getattr(update.message.chat, "title", None) or getattr(update.message.chat, "full_name", None) or getattr(update.message.chat, "username", None) or str(chat_id)),
             "vendor_id": user_id,
+            "vendor_name": full_name,
+            "vendor_username": username,
             "stage": STAGE_WAITING_ID,
             "photos": [],
             "nro_cliente": None,
             "tipo_pdv": None,
             "created_at": time.time(),
             "last_photo_time": time.time(),  # ← Timestamp para ráfaga
+            "timeout_job": None,
+            "buttons_message_id": None,
         }
     
     upload_sessions[user_id]["photos"].append({
@@ -1851,6 +2120,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             parse_mode=ParseMode.HTML,
             reply_to_message_id=message_id
         )
+        # Programar timeout de 10 min para WAITING_ID
+        job = context.job_queue.run_once(
+            _timeout_waiting_id,
+            TIMEOUT_WAITING_ID_SECONDS,
+            data={"user_id": user_id}
+        )
+        upload_sessions[user_id]["timeout_job"] = job
     except Exception as e:
         logger.error(f"Error enviando respuesta: {e}")
 
@@ -1901,6 +2177,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         session["nro_cliente"] = nro_cliente
         session["stage"] = STAGE_WAITING_TYPE
 
+        # Cancelar timeout de 10 min (vendedor respondió a tiempo)
+        _cancel_session_timeout(session)
+
         logger.info(f"✅ NRO_CLIENTE guardado: {nro_cliente} | Obteniendo tipos de PDV...")
 
         # ✅ BOTONES DINÁMICOS
@@ -1943,13 +2222,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         try:
-            await update.message.reply_text(
+            buttons_msg = await update.message.reply_text(
                 f"✅ NRO CLIENTE: <code>{nro_cliente}</code>\n\n"
                 f"Ahora seleccioná el <b>tipo de PDV</b>:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup
             )
+            session["buttons_message_id"] = buttons_msg.message_id
             logger.info(f"✅ Botones de tipo PDV enviados correctamente a {username}")
+
+            # Programar timeout de 5 min para WAITING_TYPE
+            job = context.job_queue.run_once(
+                _timeout_waiting_type,
+                TIMEOUT_WAITING_TYPE_SECONDS,
+                data={"user_id": user_id}
+            )
+            session["timeout_job"] = job
         except Exception as e:
             logger.error(f"❌ Error enviando botones a {username}: {e}", exc_info=True)
             await update.message.reply_text(
@@ -2000,179 +2288,35 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 break
         
         uploader_id = int(parts[2])
-        
+
         if uid != uploader_id:
             await q.answer("❌ Esta no es tu sesión.", show_alert=True)
             return
-        
+
         session = upload_sessions.get(uploader_id)
         if not isinstance(session, dict) or session.get("stage") != STAGE_WAITING_TYPE:
             await q.answer("⚠️ Sesión expirada.", show_alert=True)
             return
-        
-        # Guardamos el nombre bonito tanto para display como para la DB (mejora calidad de datos)
+
+        # Guard contra race condition con timeout automático
+        if session.get("_processing"):
+            await q.answer("⏳ Tu exhibición ya se está procesando.", show_alert=True)
+            return
+        session["_processing"] = True
+
+        # Cancelar timeout de 5 min (vendedor eligió tipo a tiempo)
+        _cancel_session_timeout(session)
+
         session["tipo_pdv"] = tipo_pdv_display
-        nro_cliente = session["nro_cliente"]
-        photos = session["photos"]
-        chat_id = session["chat_id"]
-        uploader_name = q.from_user.first_name or "Usuario"
-        
-        group_title = session.get("chat_title") or str(chat_id)
-        # ✅ SUBIDA INMEDIATA A DRIVE Y REGISTRO "PENDIENTE"
-        procesadas_count = 0
-        referencias_subidas = []
-        
-        for photo_data in photos:
-            file_id = photo_data["file_id"]
-            message_id = photo_data["message_id"]
-            
-            try:
-                # 1. Descargar
-                file = await context.bot.get_file(file_id)
-                file_bytes = await file.download_as_bytearray()
-                
-                # 2. Subir a Drive
-                result = sheets.upload_image_to_drive(
-                    file_bytes=bytes(file_bytes),
-                    filename=f"{nro_cliente}_{clean_code}_{int(time.time())}.jpg",
-                    user_id=uploader_id,
-                    username=uploader_name
-                    , group_title=group_title
-                )
-                
-                if result and result.drive_link:
-                    # 3. Registrar en Sheets (Genera el estado "Pendiente")
-                    uuid_ref = sheets.log_raw(
-                        user_id=uploader_id,
-                        username=uploader_name,
-                        nro_cliente=nro_cliente,
-                        tipo_pdv=tipo_pdv_display, # Guardamos el nombre bonito
-                        drive_link=result.drive_link
-                        , group_title=group_title
-                        , chat_id=chat_id
-                    )
-                    
-                    if uuid_ref:
-                        referencias_subidas.append({
-                            "uuid": uuid_ref,
-                            "message_id": message_id,
-                            "drive_link": result.drive_link
-                        })
-                        procesadas_count += 1
-            except Exception as e:
-                logger.error(f"Error procesando subida inmediata: {e}")
 
-        # ✅ LIMPIEZA Y MENSAJE DE EVALUACIÓN
-        if procesadas_count > 0:
-            try:
-                # 1. Borrar los botones de selección
-                await q.edit_message_reply_markup(reply_markup=None)
-                
-                # 2. (ELIMINADO) Ya no enviamos el mensaje de "Exhibición guardada"
-                # await context.bot.send_message(...) 
-                
-                # 3. Enviar UN SOLO mensaje de EVALUACIÓN (para todas las fotos)
-                # Usamos la primera foto como referencia visual
-                primera_ref = referencias_subidas[0]
-                
-                # Texto con cantidad de fotos si hay múltiples
-                if procesadas_count > 1:
-                    fotos_text = f"📸 <b>{procesadas_count} fotos subidas</b>\n\n"
-                else:
-                    fotos_text = ""
+        # Borrar botones de selección
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
-                # Obtener historial del PDV
-                historial = []
-                try:
-                    historial = await asyncio.to_thread(
-                        sheets.get_client_history_in_group,
-                        nro_cliente,
-                        chat_id,
-                        5
-                    )
-                except Exception as e:
-                    logger.debug(f"No se pudo obtener historial PDV: {e}")
-
-                # Construir bloque de texto del historial
-                historial_text = ""
-                if historial:
-                    estado_emoji = {
-                        "Aprobado":  "✅",
-                        "Destacado": "🔥",
-                        "Rechazado": "❌",
-                        "Pendiente": "⏳",
-                    }
-                    lineas = []
-                    for h in historial:
-                        emoji = estado_emoji.get(h["estado"], "❓")
-                        lineas.append(
-                            f"   • {h['fecha']} — {h['tipo_pdv']} — {emoji} {h['estado']}"
-                        )
-                    total_hist = len(historial)
-                    historial_text = (
-                        f"\n\n📂 <b>Historial en este PDV ({total_hist} anteriores):</b>\n"
-                        + "\n".join(lineas)
-                    )
-
-                keyboard = [
-                    [
-                        InlineKeyboardButton("✅ Aprobar", callback_data=f"APR_{primera_ref['uuid']}_{uploader_id}"),
-                        InlineKeyboardButton("❌ Rechazar", callback_data=f"REC_{primera_ref['uuid']}_{uploader_id}")
-                    ],
-                    [
-                        InlineKeyboardButton("🔥 Destacado", callback_data=f"DES_{primera_ref['uuid']}_{uploader_id}")
-                    ]
-                ]
-                
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                # Mensaje con info de la exhibición
-                msg_text = (
-                    f"📋 <b>Nueva exhibición</b>\n\n"
-                    f"{fotos_text}"
-                    f"👤 <b>Vendedor:</b> {uploader_name}\n"
-                    f"🏪 <b>Cliente:</b> {nro_cliente}\n"
-                    f"📍 <b>Tipo:</b> {tipo_pdv_display}\n"
-                    f"🔗 <a href='{primera_ref['drive_link']}'>Ver en Drive</a>"
-                    f"{historial_text}\n\n"
-                    f"<b>Evaluar:</b>"
-                )
-                
-                # Enviar mensaje respondiendo a la PRIMERA foto
-                sent_msg = await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=msg_text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup,
-                    reply_to_message_id=primera_ref["message_id"]
-                )
-                
-                # Actualizar telegram_refs para TODAS las fotos (para tracking)
-                for ref_data in referencias_subidas:
-                    sheets.update_telegram_refs(
-                        uuid_ref=ref_data["uuid"], 
-                        chat_id=int(chat_id), 
-                        msg_id=int(sent_msg.message_id)
-                    )
-                
-                # Guardar transacción activa (solo una vez)
-                active_transactions[sent_msg.message_id] = {
-                    "uuid": primera_ref["uuid"],
-                    "uploader_id": uploader_id,
-                    "ref_msg": primera_ref["message_id"],
-                    "total_fotos": procesadas_count  # ← Info adicional
-                }
-
-            except Exception as e:
-                logger.error(f"Error en post-procesamiento: {e}")
-        else:
-            try:
-                await q.edit_message_text("❌ Error al subir las fotos a Drive.")
-            except:
-                pass
-
-        # Limpiar sesión
-        del upload_sessions[uploader_id]
+        # Procesar subida (Drive + Sheets + mensaje evaluación)
+        await _process_upload_session(context.bot, uploader_id, session)
         return
     
     # Botones de aprobación/rechazo
@@ -2239,16 +2383,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         # Mensaje Final
         txt = q.message.text_html.split("\n\n")[0] if q.message and q.message.text_html else ""
-        
+
+        # Preservar historial del mensaje original
+        historial_text = ""
+        if q.message and q.message.text_html:
+            original_html = q.message.text_html
+            hist_start = original_html.find("\U0001F4C2")  # 📂
+            if hist_start != -1:
+                hist_end = original_html.find("\n\n", hist_start)
+                historial_text = "\n\n" + (original_html[hist_start:hist_end] if hist_end != -1 else original_html[hist_start:])
+
         if status == "Destacado":
              mensaje_final = (
                 f"{txt}\n\n"
                 f"🔥 <b>¡EXHIBICIÓN DESTACADA!</b> 🔥\n"
                 f"✨ Evaluada por <b>{q.from_user.first_name}</b>\n"
                 f"🚀 <b>Ejecución Perfecta</b> • ¡Sumaste 2 puntos extra!"
+                f"{historial_text}"
             )
         else:
-             mensaje_final = f"{txt}\n\n{icon} <b>{status}</b> por {q.from_user.first_name}"
+             mensaje_final = f"{txt}\n\n{icon} <b>{status}</b> por {q.from_user.first_name}{historial_text}"
         
         await q.edit_message_text(
             mensaje_final,
@@ -2378,33 +2532,35 @@ async def procesar_cola_imagenes_pendientes(context: ContextTypes.DEFAULT_TYPE) 
 
 async def cleanup_expired_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Limpia sesiones de upload que llevan más de 10 minutos sin completarse.
-    Previene memory leaks de sesiones zombies.
+    Safety net: limpia sesiones que los timeouts explícitos no pudieron limpiar.
+    Los timeouts normales son 10 min (WAITING_ID) y 5 min (WAITING_TYPE).
+    Este cleanup usa 15 min como margen de seguridad (900 segundos).
     """
     if bot_hibernating:
         return
     if host_lock and not host_lock.is_host:
         return
-    
+
     try:
         now = time.time()
         to_delete = []
-        
+
         for user_id, session in upload_sessions.items():
             created_at = session.get("created_at", now)
             age_seconds = now - created_at
-            
-            # Eliminar sesiones > 10 minutos (600 segundos)
-            if age_seconds > 600:
+
+            # Safety net: eliminar sesiones > 15 minutos (900 segundos)
+            if age_seconds > 900:
                 to_delete.append(user_id)
                 logger.info(f"🧹 Limpiando sesión expirada: user_id={user_id}, edad={int(age_seconds/60)} min")
-        
+
         for user_id in to_delete:
+            _cancel_session_timeout(upload_sessions[user_id])
             del upload_sessions[user_id]
-        
+
         if to_delete:
             logger.info(f"🧹 Total de sesiones expiradas limpiadas: {len(to_delete)}")
-            
+
     except Exception as e:
         logger.error(f"Error en cleanup_expired_sessions: {e}")
 
