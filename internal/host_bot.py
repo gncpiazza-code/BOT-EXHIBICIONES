@@ -2239,16 +2239,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         # Mensaje Final
         txt = q.message.text_html.split("\n\n")[0] if q.message and q.message.text_html else ""
-        
+
+        # Preservar historial del mensaje original
+        historial_text = ""
+        if q.message and q.message.text_html:
+            original_html = q.message.text_html
+            hist_start = original_html.find("\U0001F4C2")  # 📂
+            if hist_start != -1:
+                hist_end = original_html.find("\n\n", hist_start)
+                historial_text = "\n\n" + (original_html[hist_start:hist_end] if hist_end != -1 else original_html[hist_start:])
+
         if status == "Destacado":
              mensaje_final = (
                 f"{txt}\n\n"
                 f"🔥 <b>¡EXHIBICIÓN DESTACADA!</b> 🔥\n"
                 f"✨ Evaluada por <b>{q.from_user.first_name}</b>\n"
                 f"🚀 <b>Ejecución Perfecta</b> • ¡Sumaste 2 puntos extra!"
+                f"{historial_text}"
             )
         else:
-             mensaje_final = f"{txt}\n\n{icon} <b>{status}</b> por {q.from_user.first_name}"
+             mensaje_final = f"{txt}\n\n{icon} <b>{status}</b> por {q.from_user.first_name}{historial_text}"
         
         await q.edit_message_text(
             mensaje_final,
